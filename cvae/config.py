@@ -115,18 +115,21 @@ PHOTON_SLOTS = _env_flag("CVAE_PHOTON_SLOTS", False)
 MYY_HEAD = _env_flag("CVAE_MYY_HEAD", False)
 MYY_HEAD_WEIGHT = _env_float("CVAE_MYY_HEAD_WEIGHT", 10.0)
 DEC_MYY = os.environ.get("CVAE_DEC_MYY", "true").strip().lower()
-# Adversarial decoupling of z from myy (gradient reversal, Ganin & Lempitsky
-# 2015 / Louppe et al. 2017 "learning to pivot"): an MLP classifies the myy bin
-# (ADV_BINS equal bins over the SB) from mu; the encoder gets -ADV_WEIGHT x its
-# cross-entropy. This is the same question the closure classifier asks.
+# Adversarial decoupling of z from myy (Louppe et al. 2017, "learning to
+# pivot"): an MLP classifies the myy bin (ADV_BINS equal bins over the SB) from
+# mu — the same question the closure classifier asks. Per batch the adversary
+# first takes ADV_STEPS own Adam steps on the detached mu (so it stays close to
+# optimal), then the encoder gets ADV_WEIGHT x KL(bin prior || adversary
+# output), which is 0 iff the adversary can do no better than the prior.
+# (Plain gradient reversal with one shared step failed: the encoder dodged the
+# adversary, which stayed at chance while z leaked myy at AUC 0.95.)
 ADV_WEIGHT = _env_float("CVAE_ADV_WEIGHT", 0.0)
 ADV_BINS = _env_int("CVAE_ADV_BINS", 8)
 ADV_HIDDEN = _env_int("CVAE_ADV_HIDDEN", 128)
 ADV_WARMUP_EPOCHS = _env_int("CVAE_ADV_WARMUP_EPOCHS", 5)  # weight 0, then
 ADV_RAMP_EPOCHS = _env_int("CVAE_ADV_RAMP_EPOCHS", 10)      # linear ramp
-# The adversary must keep up with the encoder: its param group runs at
-# ADV_LR_MULT x the encoder LR (same schedule).
-ADV_LR_MULT = _env_float("CVAE_ADV_LR_MULT", 5.0)
+ADV_STEPS = _env_int("CVAE_ADV_STEPS", 5)
+ADV_LR = _env_float("CVAE_ADV_LR", 1e-3)
 
 # --- Explored and rejected (kept for reproducibility; off by default) -----------
 # Decorrelation penalty lambda * dCor^2(mu, myy) (DisCo). At lambda >= 300 it

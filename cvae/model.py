@@ -48,22 +48,6 @@ class SlotDecoder(nn.Module):
         return out[:, self.gather_idx]
 
 
-class _GradReverse(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, scale):
-        ctx.scale = scale
-        return x.view_as(x)
-
-    @staticmethod
-    def backward(ctx, g):
-        return -ctx.scale * g, None
-
-
-def grad_reverse(x, scale):
-    """Identity forward; gradient multiplied by -scale backward."""
-    return _GradReverse.apply(x, scale)
-
-
 class MyyAdversary(nn.Module):
     """Classifies the SB myy bin from the latent (logits over ADV_BINS)."""
 

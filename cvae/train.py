@@ -17,11 +17,11 @@ pseudo-data, so the in-batch dCor is a plain estimate on the physical mix).
 Loss = v2_model vae_loss (masked recon summed over targets, BCE on binary
        heads, + KL_WEIGHT * KL(q(z|x) || N(0,I)))
        [+ MYY_HEAD_WEIGHT * MSE(m_hat, c)]                fixed myy latent dim
-       [- ADV_WEIGHT * CE(adversary(mu), myy bin)]        via gradient reversal
+       [+ ADV_WEIGHT * KL(myy-bin prior || adversary(mu))]
        [+ DISCO_WEIGHT * dCor^2(mu, myy), off]
-The adversary itself minimizes the CE (same optimizer; the reversal flips the
-sign for the encoder only). Model selection uses the val vae + head terms,
-counted only once the adversary / DisCo weights are at full strength.
+The myy adversary has its own Adam and takes ADV_STEPS steps on the detached
+mu of each batch before the encoder step. Model selection uses the val vae +
+head terms, counted only once the adversary / DisCo weights are at full strength.
 """
 from __future__ import annotations
 
@@ -48,26 +48,25 @@ from src.embedding_models.v2_model.train import _save_reconstruction_pdf
 from cvae import config as C
 from cvae import data as D
 from cvae.losses import distance_corr, hetero_vae_loss
-from cvae.model import ParTCVAE, grad_reverse, myy_bin
+from cvae.model import ParTCVAE, myy_bin
 
 logger = logging.getLogger("cvae.train")
 
 
 def _make_optimizer(model):
     # Same grouping as contrastive_encoder.train: no decay on 1-D params and class_token.
-    # The myy adversary gets its own group at ADV_LR_MULT x LR.
-    decay, no_decay, adv = [], [], []
-    for n, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        if n.startswith("adversary."):
-            adv.append(p)
-        else:
-            (no_decay if (p.ndim == 1 or n.endswith("class_token")) else decay).append(p)
-    groups = [{"params": decay, "weight_decay": C.WEIGHT_DECAY}, {"params": no_decay, "weight_decay": 0.0}]
-    if adv:
-        groups.append({"params": adv, "weight_decay": 0.0, "lr": C.LR * C.ADV_LR_MULT})
-    return optim.AdamW(groups, lr=C.LR)
+    # The myy adversary is excluded (it has its own optimizer).
+    decay, no_decay = [], []
+    for n, p in _main_params(model):
+        (no_decay if (p.ndim == 1 or n.endswith("class_token")) else decay).append(p)
+    return optim.AdamW(
+        [{"params": decay, "weight_decay": C.WEIGHT_DECAY}, {"params": no_decay, "weight_decay": 0.0}],
+        lr=C.LR,
+    )
+
+
+def _main_params(model):
+    return [(n, p) for n, p in model.named_parameters() if p.requires_grad and not n.startswith("adversary.")]
 
 
 def _make_scheduler(optimizer, total_steps):
@@ -81,11 +80,23 @@ def _make_scheduler(optimizer, total_steps):
     )
 
 
-METRICS = ("total", "recon", "kl", "dcor", "adv", "adv_acc", "mhat", "select")
+METRICS = ("total", "recon", "kl", "dcor", "adv", "adv_acc", "adv_kl", "mhat", "select")
 
 
-def _loss_terms(model, batch, is_bin, lam, is_btag=None, adv_lam=0.0):
-    """Returns (total loss, metrics vector in METRICS order, x_hat)."""
+def _adv_update(adversary, adv_opt, mu, cond):
+    """ADV_STEPS Adam steps of the adversary on the detached latent (fp32)."""
+    target = myy_bin(cond)
+    x = mu.detach().float()
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        for _ in range(C.ADV_STEPS):
+            adv_opt.zero_grad(set_to_none=True)
+            torch.nn.functional.cross_entropy(adversary(x), target).backward()
+            adv_opt.step()
+
+
+def _loss_terms(model, batch, is_bin, lam, is_btag=None, adv_lam=0.0, adv_prior=None, adv_opt=None):
+    """Returns (total loss, metrics vector in METRICS order, x_hat). With
+    ``adv_opt`` the adversary is first updated on this batch (training only)."""
     pl, inter, hl, mask, tgt, tm, cond = batch
     if is_btag is not None and C.BTAG_POS_WEIGHT != 1.0:
         # Per-element weight inside the mask: vae_loss takes a masked weighted mean.
@@ -115,17 +126,20 @@ def _loss_terms(model, batch, is_bin, lam, is_btag=None, adv_lam=0.0):
         mh = ((m_hat.float() - cond) ** 2).mean()
         total = total + C.MYY_HEAD_WEIGHT * mh
     select = vae + C.MYY_HEAD_WEIGHT * mh
-    adv, adv_acc = zero, zero
+    adv, adv_acc, adv_kl = zero, zero, zero
     adversary = getattr(model, "adversary", None)
     if adversary is not None:
-        # The adversary always trains (minimizes CE); the encoder sees the
-        # reversed gradient scaled by adv_lam (0 during warm-up).
-        logits = adversary(grad_reverse(mu.float(), adv_lam)).float()
+        if adv_opt is not None:
+            _adv_update(adversary, adv_opt, mu, cond)
+        with torch.autocast(device_type=mu.device.type, enabled=False):
+            logp = torch.log_softmax(adversary(mu.float()), dim=1)
         target = myy_bin(cond)
-        adv = torch.nn.functional.cross_entropy(logits, target)
-        adv_acc = (logits.argmax(1) == target).float().mean()
-        total = total + adv
-    return total, torch.stack([total, rec, kl, dc, adv, adv_acc, mh, select]).detach().float(), x_hat
+        adv = torch.nn.functional.nll_loss(logp, target)
+        adv_acc = (logp.argmax(1) == target).float().mean()
+        # KL(prior || p_adv): 0 iff the adversary output is the bin prior.
+        adv_kl = (adv_prior * (adv_prior.log() - logp)).sum(1).mean()
+        total = total + adv_lam * adv_kl
+    return total, torch.stack([total, rec, kl, dc, adv, adv_acc, adv_kl, mh, select]).detach().float(), x_hat
 
 
 def disco_lambda(epoch):
@@ -231,6 +245,15 @@ def train(run_dir, seed=0, device="cuda"):
                 sum(p.numel() for p in base_model.parameters()), C.LATENT_DIM, n_targets)
 
     optimizer = _make_optimizer(base_model)
+    adv_opt, adv_prior = None, None
+    if base_model.adversary is not None:
+        adv_opt = optim.Adam(base_model.adversary.parameters(), lr=C.ADV_LR)
+        # Bin prior of the (event-weighted) training sample = what batches draw.
+        b = myy_bin(torch.as_tensor(tr["cond"]))
+        adv_prior = torch.bincount(b, weights=torch.as_tensor(tr["weight"], dtype=torch.float64),
+                                   minlength=C.ADV_BINS).float()
+        adv_prior = (adv_prior / adv_prior.sum()).to(device)[None, :]
+        logger.info("myy adversary: bin prior %s", adv_prior.cpu().numpy().round(3))
     total_steps = len(train_loader) * C.EPOCHS
     sched = _make_scheduler(optimizer, total_steps)
 
@@ -260,6 +283,7 @@ def train(run_dir, seed=0, device="cuda"):
                 "epoch": epoch,
                 "model": base_model.state_dict(),
                 "optimizer": optimizer.state_dict(),
+                "adv_opt": adv_opt.state_dict() if adv_opt is not None else None,
                 "sched": sched.state_dict(),
                 "hist": hist,
                 "best": (best_val, best_epoch, bad),
@@ -278,6 +302,8 @@ def train(run_dir, seed=0, device="cuda"):
     if resume is not None:
         base_model.load_state_dict(resume["model"])
         optimizer.load_state_dict(resume["optimizer"])
+        if adv_opt is not None:
+            adv_opt.load_state_dict(resume["adv_opt"])
         sched.load_state_dict(resume["sched"])
         hist = resume["hist"]
         best_val, best_epoch, bad = resume["best"]
@@ -302,10 +328,10 @@ def train(run_dir, seed=0, device="cuda"):
         for batch in train_loader:
             optimizer.zero_grad(set_to_none=True)
             with amp_ctx():
-                total, m, _ = _loss_terms(model, batch, is_bin, lam, is_btag, alam)
+                total, m, _ = _loss_terms(model, batch, is_bin, lam, is_btag, alam, adv_prior, adv_opt)
             total.backward()
             if C.GRAD_CLIP > 0:
-                torch.nn.utils.clip_grad_norm_(base_model.parameters(), C.GRAD_CLIP)
+                torch.nn.utils.clip_grad_norm_([p for _n, p in _main_params(base_model)], C.GRAD_CLIP)
             optimizer.step()
             sched.step()
             acc += m
@@ -317,7 +343,7 @@ def train(run_dir, seed=0, device="cuda"):
         with torch.no_grad():
             for b in range(n_vb):
                 with amp_ctx():
-                    _t, m, _ = _loss_terms(model, va_ds.get_batch(val_idx[b]), is_bin, lam, is_btag, alam)
+                    _t, m, _ = _loss_terms(model, va_ds.get_batch(val_idx[b]), is_bin, lam, is_btag, alam, adv_prior)
                 vacc += m
         va_m = (vacc / n_vb).tolist()
 

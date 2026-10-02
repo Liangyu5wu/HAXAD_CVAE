@@ -8,7 +8,7 @@ with one conditional VAE whose latent space is
 so that events can later be generated at a *specified* myy instead of relying
 on a generator to interpolate into the signal region.
 
-- **Step 1 (this version): a CVAE that reconstructs events well.** Done; see
+- **Step 1 (this version): a CVAE that reconstructs events well.** Done (production runs `step1_seed{0,1}`); see
   results below.
 - Step 2 (next): build the generative model on top of this latent
   (e.g. model p(z | myy) in the SB, or resample, then decode / classify).
@@ -88,6 +88,23 @@ setsid nohup srun --jobid=<JOBID> --overlap -N1 -n1 -c 32 --gpus=1 bash -c '
 new allocation and training resumes from `last.pt`.
 
 ## Step-1 results (SB test fold unless noted; R², btag = ROC AUC)
+
+Production runs (`store/runs/step1_seed{0,1}`, config defaults, 400 epochs,
+best epoch 378 for both). "core" = jet1–4 + fatjet1 targets.
+
+| region | core R² median: seed 0 / seed 1 | slot 250 ep (dev) |
+|---|---|---|
+| SB test | 0.967 / 0.966 | 0.948 |
+| SR | 0.969 / 0.970 | 0.950 |
+| signal XHH_500 | 0.773 / 0.766 | 0.690 |
+| signal HVT_VcXjjHyy_2000_300 | 0.762 / 0.763 | 0.619 |
+| signal WN_HyyN_300 | 0.792 / 0.812 | 0.754 |
+| signal TT_tZNtHyyN_1000_205_60 | 0.275 / 0.451 | 0.316 |
+
+SB test per target (seed 0 / seed 1): jet1 pt 0.99/0.99, jet2 pt 0.97/0.98,
+jet3 pt 0.85/0.86, jet4 pt 0.63/0.81, jet4 m 0.82/0.84, fatjet1 pt 0.72/0.77,
+fatjet1 m 0.34/0.37, τ32 0.34/0.35; btag AUC 1.000; MET / high-level ≥ 0.99.
+Closure of μ: SB-low vs SB-high AUC 0.655 / 0.653, SR vs SB 0.538 / 0.536.
 
 Development scan (latent 16, β 0.01, btag ×10 unless noted):
 

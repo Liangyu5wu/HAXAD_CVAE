@@ -65,6 +65,7 @@ on a generator to interpolate into the signal region.
 | `cvae/evaluate.py` | per-target R² / acc / AUC on sb_test, sr, signals |
 | `cvae/encode.py` | latents (μ, z) for all SB + SR events |
 | `cvae/closure.py` | myy-independence tests of the latent (input to step 2) |
+| `cvae/plots.py` | diagnostics.pdf (+ PNGs): latent activity, μ per dim by split / myy, ⟨μ⟩ vs myy, correlations, posterior vs prior, recon vs truth, prior-decoded targets |
 
 Reused from haxad_demonstrator (imported, never modified): `setup.sh`, the law
 tasks for paths, `Data`, contrastive `build_arrays` / norms / `DPTModel` /

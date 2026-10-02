@@ -16,6 +16,7 @@ import os
 import numpy as np
 import torch
 
+from cvae import config as C
 from cvae import data as D
 from cvae.model import ParTCVAE
 
@@ -25,6 +26,11 @@ logger = logging.getLogger("cvae.encode")
 def load_model(ckpt_path, device):
     ck = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg = ck["config"]
+    # The slot layout is fixed at import time from the env (data.py); it must
+    # match the checkpoint's.
+    if cfg.get("PHOTON_SLOTS", False) != C.PHOTON_SLOTS:
+        raise RuntimeError(f"{ckpt_path} was trained with PHOTON_SLOTS={cfg.get('PHOTON_SLOTS', False)}: "
+                           f"set CVAE_PHOTON_SLOTS={int(cfg.get('PHOTON_SLOTS', False))}")
     model = ParTCVAE(
         n_targets=ck["n_targets"],
         latent_dim=cfg["LATENT_DIM"],
@@ -34,6 +40,9 @@ def load_model(ckpt_path, device):
         enc_cond=cfg.get("ENC_COND", False),  # absent in pre-ENC_COND checkpoints
         dec_learn_var=cfg.get("DEC_LEARN_VAR", False),
         decoder=cfg.get("DECODER", "mlp"),
+        myy_head=cfg.get("MYY_HEAD", False),
+        dec_myy=cfg.get("DEC_MYY", "true"),
+        adversary=cfg.get("ADV_WEIGHT", 0.0) > 0,
     )
     model.load_state_dict(ck["model"])
     return model.to(device).eval(), ck
@@ -43,15 +52,16 @@ def load_model(ckpt_path, device):
 def encode_arrays(model, arrays, inter_norm, device, batch_size=16384, seed=0):
     ds = D.CVAEDataSet(arrays, device, inter_norm)
     torch.manual_seed(seed)
-    mus, zs = [], []
+    mus, zs, ms = [], [], []
     for i in range(0, len(ds), batch_size):
         idx = torch.arange(i, min(i + batch_size, len(ds)), device=device)
         pl, inter, hl, mask, _tgt, _tm, cond = ds.get_batch(idx)
-        mu, logvar = model.encode_mulogvar((pl, inter, hl, mask), cond)
+        m_hat, mu, logvar = model.encode_full((pl, inter, hl, mask), cond)
         mus.append(mu.float().cpu().numpy())
         zs.append(model.encoder.reparameterize(mu, logvar).float().cpu().numpy())
+        ms.append(m_hat[:, 0].float().cpu().numpy() if m_hat is not None else np.full(len(mu), np.nan, np.float32))
     del ds
-    return np.concatenate(mus), np.concatenate(zs)
+    return np.concatenate(mus), np.concatenate(zs), np.concatenate(ms)
 
 
 def encode_run(run_dir, device="cuda", chunk=1_000_000):
@@ -63,12 +73,13 @@ def encode_run(run_dir, device="cuda", chunk=1_000_000):
     inter_norm = D.interaction_norm_from(norm_params)
     rotate = bool(ck["config"]["ROTATE_PHI"])
 
-    mus, zs = [], []
+    mus, zs, ms = [], [], []
     for s in range(0, len(df), chunk):
         arr = D.build_inputs(df.iloc[s:s + chunk], norm_params, rotate=rotate)
-        mu, z = encode_arrays(model, arr, inter_norm, device, seed=ck["seed"] + s)
+        mu, z, m = encode_arrays(model, arr, inter_norm, device, seed=ck["seed"] + s)
         mus.append(mu)
         zs.append(z)
+        ms.append(m)
         logger.info("encoded %d / %d", min(s + chunk, len(df)), len(df))
 
     out = os.path.join(run_dir, "latents.npz")
@@ -76,6 +87,7 @@ def encode_run(run_dir, device="cuda", chunk=1_000_000):
         out,
         mu=np.concatenate(mus),
         z=np.concatenate(zs),
+        m_hat=np.concatenate(ms),  # fixed myy dim, in c = (myy - 125 GeV) / 20 GeV units (NaN without MYY_HEAD)
         myy=df["diphoton_mass"].to_numpy(np.float32),
         weight=df["event_weight"].to_numpy(np.float32),
         process_id=df["process_id"].to_numpy(np.int64),

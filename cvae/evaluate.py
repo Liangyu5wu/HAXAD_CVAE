@@ -40,7 +40,7 @@ logger = logging.getLogger("cvae.evaluate")
 DEFAULT_REGIONS = "sb_test,sr,signal:XHH_500,signal:HVT_VcXjjHyy_2000_300,signal:WN_HyyN_300,signal:TT_tZNtHyyN_1000_205_60"
 # Summary set: jet and leading-fatjet kinematics (leptons / fatjet2 are almost
 # never present in the SB background, their R^2 is not meaningful there).
-CORE_PREFIXES = ("jet", "fatjet1")
+CORE_PREFIXES = ("jet", "fatjet1")  # photon targets are reported but not in the summary
 
 
 def load_signal(name):
@@ -81,13 +81,16 @@ def region_frame(region, seed, n, rng):
 @torch.no_grad()
 def reconstruct(model, arrays, inter_norm, device, batch_size=16384):
     ds = D.CVAEDataSet(arrays, device, inter_norm)
-    outs = []
+    outs, mh = [], []
     for i in range(0, len(ds), batch_size):
         idx = torch.arange(i, min(i + batch_size, len(ds)), device=device)
         pl, it, hl, m, _t, _tm, c = ds.get_batch(idx)
-        outs.append(model.decode(model.encode((pl, it, hl, m), c), c).float().cpu().numpy())
+        x_hat, _z, _mu, _lv, m_hat = model((pl, it, hl, m), c)
+        outs.append(x_hat.float().cpu().numpy())
+        if m_hat is not None:
+            mh.append(m_hat[:, 0].float().cpu().numpy())
     del ds
-    return np.concatenate(outs)
+    return np.concatenate(outs), (np.concatenate(mh) if mh else None)
 
 
 def metrics(arrays, x_hat):
@@ -120,8 +123,10 @@ def metrics(arrays, x_hat):
 
 
 def _fmt(region, rows, summary):
+    extra = (f"  myy dim R2 {summary['myy_head_r2']:.4f} (rms {summary['myy_head_rms_gev']:.2f} GeV)"
+             if "myy_head_r2" in summary else "")
     lines = [f"===== {region}  n={summary['n']}  core R2 median {summary['core_r2_median']:.3f} "
-             f"min {summary['core_r2_min']:.3f}  btag AUC min {summary['btag_auc_min']:.3f}",
+             f"min {summary['core_r2_min']:.3f}  btag AUC min {summary['btag_auc_min']:.3f}{extra}",
              f"{'target':22s} {'R2/acc':>7s} {'auc':>7s} {'valid':>7s}"]
     for n, r in rows.items():
         main = r.get("r2", r.get("acc"))
@@ -142,7 +147,12 @@ def evaluate(run_dir, regions=DEFAULT_REGIONS, n=100_000, device="cuda"):
     for region in [r for r in regions.split(",") if r]:
         df = region_frame(region, ck["seed"], n, rng)
         arrays = D.build_inputs(df, norm, rotate=rotate)
-        rows, summary = metrics(arrays, reconstruct(model, arrays, inter_norm, device))
+        x_hat, m_hat = reconstruct(model, arrays, inter_norm, device)
+        rows, summary = metrics(arrays, x_hat)
+        if m_hat is not None:  # the fixed myy latent dim vs the true myy
+            c = arrays["cond"][:, 0]
+            summary["myy_head_r2"] = float(1.0 - ((m_hat - c) ** 2).mean() / c.var())
+            summary["myy_head_rms_gev"] = float(np.sqrt(((m_hat - c) ** 2).mean()) * C.MYY_SCALE / 1e3)
         out[region] = {"summary": summary, "targets": rows}
         text = _fmt(region, rows, summary)
         with open(os.path.join(run_dir, f"eval_{region.replace(':', '_')}.txt"), "w") as f:

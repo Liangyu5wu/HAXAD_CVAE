@@ -68,7 +68,7 @@ ENCODER_KWARGS = dict(
     num_conv_layers=_ce.NUM_CONV_LAYERS,
     interaction_norm_type=os.environ.get("CVAE_INTERACTION_NORM", "layernorm").strip().lower(),
 )
-INPUT_SHAPE = _ce.INPUT_SHAPE
+INPUT_SHAPE = _ce.INPUT_SHAPE  # without photon slots; the model uses data.INPUT_SHAPE
 
 # --- Loss ---------------------------------------------------------------------
 # v2_model vae_loss: masked recon (MSE continuous, BCE exist/btag) as a
@@ -96,6 +96,37 @@ ETA_MIN = _env_float("CVAE_ETA_MIN", _ce.ETA_MIN)
 MAX_TRAIN_EVENTS = _env_int("CVAE_MAX_TRAIN_EVENTS", 0)
 USE_AMP = _env_flag("CVAE_USE_AMP", True)
 USE_COMPILE = _env_flag("CVAE_USE_COMPILE", False)
+
+# --- Step 1b: myy-decoupled latent (under study; off by default) ----------------
+# The step-1 latent carries myy information (SB low-vs-high AUC 0.65) because
+# it must encode diphoton pT and dR, which together depend on myy, while the
+# encoder cannot see myy to encode them *relative to* myy. Three pieces:
+# Add the two photons as particle slots (pt, eta, phi; own type flag) to the
+# encoder inputs and to the reconstruction targets. myy is then computable
+# from the inputs (it is the photon-photon pair mass of the interaction
+# features), so the encoder can remove it from z.
+PHOTON_SLOTS = _env_flag("CVAE_PHOTON_SLOTS", False)
+# Fixed latent dim: one extra encoder output m_hat regressed onto
+# c = (myy - 125 GeV) / 20 GeV (MSE x MYY_HEAD_WEIGHT, no KL, not sampled).
+# DEC_MYY: what the decoder's myy input is during training — "true" (the
+# event's c; m_hat is then only a check that myy is readable from the inputs)
+# or "pred" (m_hat itself, i.e. the myy dim of the latent). At generation the
+# dim is set by hand either way.
+MYY_HEAD = _env_flag("CVAE_MYY_HEAD", False)
+MYY_HEAD_WEIGHT = _env_float("CVAE_MYY_HEAD_WEIGHT", 10.0)
+DEC_MYY = os.environ.get("CVAE_DEC_MYY", "true").strip().lower()
+# Adversarial decoupling of z from myy (gradient reversal, Ganin & Lempitsky
+# 2015 / Louppe et al. 2017 "learning to pivot"): an MLP classifies the myy bin
+# (ADV_BINS equal bins over the SB) from mu; the encoder gets -ADV_WEIGHT x its
+# cross-entropy. This is the same question the closure classifier asks.
+ADV_WEIGHT = _env_float("CVAE_ADV_WEIGHT", 0.0)
+ADV_BINS = _env_int("CVAE_ADV_BINS", 8)
+ADV_HIDDEN = _env_int("CVAE_ADV_HIDDEN", 128)
+ADV_WARMUP_EPOCHS = _env_int("CVAE_ADV_WARMUP_EPOCHS", 5)  # weight 0, then
+ADV_RAMP_EPOCHS = _env_int("CVAE_ADV_RAMP_EPOCHS", 10)      # linear ramp
+# The adversary must keep up with the encoder: its param group runs at
+# ADV_LR_MULT x the encoder LR (same schedule).
+ADV_LR_MULT = _env_float("CVAE_ADV_LR_MULT", 5.0)
 
 # --- Explored and rejected (kept for reproducibility; off by default) -----------
 # Decorrelation penalty lambda * dCor^2(mu, myy) (DisCo). At lambda >= 300 it

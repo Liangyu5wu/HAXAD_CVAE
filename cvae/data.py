@@ -36,6 +36,8 @@ from src.data.data import Data
 from src.embedding_models import get_encoder
 from src.embedding_models.contrastive_encoder.encode import _load_norm_params
 from src.embedding_models.contrastive_encoder.features import (
+    NUM_INTERACTION_FEATURES,
+    NUM_PARTICLE_FEATURES,
     NUM_PARTICLES,
     _HIGHLEVEL_FEATURE_ORDER,
     _PARTICLE_SLOTS,
@@ -56,6 +58,18 @@ logger = logging.getLogger(__name__)
 PHOTON_COLS = [f"photon{i}_{v}" for i in (1, 2) for v in ("pt", "eta", "phi")]
 META_COLS = ["process_id", "diphoton_mass", "event_weight", "event_number"]
 LOAD_COLS = list(dict.fromkeys(_RAW_KINEMATIC_COLUMNS + _RAW_HIGHLEVEL_COLUMNS + PHOTON_COLS + META_COLS))
+
+# Slot layout: the contrastive encoder's 11 slots, plus (PHOTON_SLOTS) the two
+# photons as slots 11-12 with pt, eta, phi, m = 0 and their own type flag
+# (one extra one-hot column, 0 for every other slot). Photons are always
+# present in these categories. Their pair mass in the interaction features is
+# exactly myy.
+PHOTON_PREFIXES = ("photon1", "photon2") if C.PHOTON_SLOTS else ()
+SLOT_PREFIXES = [p for p, *_ in _PARTICLE_SLOTS] + list(PHOTON_PREFIXES)
+N_SLOTS = len(SLOT_PREFIXES)
+N_FEAT = NUM_PARTICLE_FEATURES + (1 if C.PHOTON_SLOTS else 0)
+N_HL = len(_HIGHLEVEL_FEATURE_ORDER)
+INPUT_SHAPE = ((N_SLOTS, N_FEAT), (N_SLOTS, N_SLOTS, NUM_INTERACTION_FEATURES), (N_HL,))
 
 # Region codes stored alongside every event.
 SB_TRAIN, SB_VAL, SB_TEST, SR = 0, 1, 2, 3
@@ -190,13 +204,15 @@ def rotate_phi(df):
     """Return a copy of ``df`` with every object phi measured from phi_yy."""
     ref = diphoton_phi(df)
     df = df.copy()
-    for col in _RAW_KINEMATIC_COLUMNS:
+    for col in _RAW_KINEMATIC_COLUMNS + ["photon1_phi", "photon2_phi"]:
         if col.endswith("_phi"):
             df[col] = _wrap(df[col].to_numpy(np.float64) - ref).astype(np.float32)
     return df
 
 
 def _slot_kind(prefix):
+    if prefix.startswith("photon"):
+        return "photon"
     if prefix.startswith("fatjet"):
         return "fatjet"
     if prefix.startswith("jet"):
@@ -213,6 +229,7 @@ _KIND_FIELDS = {
                ("btag", True), ("tau32", False), ("tau43", False)],
     "lepton": [("exist", True), ("pt", False), ("eta", False), ("cosphi", False), ("sinphi", False)],
     "met": [("pt", False), ("cosphi", False), ("sinphi", False)],
+    "photon": [("pt", False), ("eta", False), ("cosphi", False), ("sinphi", False)],
 }
 # Column in the 12-dim normalized particle vector for each regressed field.
 _PL_IDX = {"pt": 0, "eta": 1, "m": 3, "btag": 4, "tau32": 5, "tau43": 6}
@@ -221,7 +238,7 @@ _PL_IDX = {"pt": 0, "eta": 1, "m": 3, "btag": 4, "tau32": 5, "tau43": 6}
 def target_spec():
     """[(name, is_binary, slot_idx | None, field)] in target-vector order."""
     spec = []
-    for s, (prefix, *_rest) in enumerate(_PARTICLE_SLOTS):
+    for s, prefix in enumerate(SLOT_PREFIXES):
         for field, is_bin in _KIND_FIELDS[_slot_kind(prefix)]:
             spec.append((f"{prefix}_{field}", is_bin, s, field))
     for h in _HIGHLEVEL_FEATURE_ORDER:
@@ -235,12 +252,12 @@ SLOT_FIELDS = ["exist", "pt", "eta", "cosphi", "sinphi", "m", "btag", "tau32", "
 
 
 def slot_gather_index():
-    """(T,) indices into [slot outputs (NUM_PARTICLES * len(SLOT_FIELDS)), high-level (7)]."""
+    """(T,) indices into [slot outputs (N_SLOTS * len(SLOT_FIELDS)), high-level (7)]."""
     nf = len(SLOT_FIELDS)
     idx = []
     for _name, _is_bin, s, field in target_spec():
         if s is None:
-            idx.append(NUM_PARTICLES * nf + _HIGHLEVEL_FEATURE_ORDER.index(field))
+            idx.append(N_SLOTS * nf + _HIGHLEVEL_FEATURE_ORDER.index(field))
         else:
             idx.append(s * nf + SLOT_FIELDS.index(field))
     return idx
@@ -281,11 +298,33 @@ def build_targets(particle_level, kin_raw, high_level, mask):
     return tgt, tm
 
 
+def _add_photon_slots(df, particle_level, kin_raw, mask):
+    """Append the photon slots (raw units, before normalization). Photon pt
+    shares the pooled log-mean-std of all slots; eta / phi are used as is,
+    like every other object."""
+    n, k = len(df), len(PHOTON_PREFIXES)
+    pl = np.full((n, k, N_FEAT), np.nan, dtype=np.float32)
+    for i, p in enumerate(PHOTON_PREFIXES):
+        pl[:, i, 0] = df[f"{p}_pt"].to_numpy(np.float32)
+        pl[:, i, 1] = df[f"{p}_eta"].to_numpy(np.float32)
+        pl[:, i, 2] = df[f"{p}_phi"].to_numpy(np.float32)
+        pl[:, i, 3] = 0.0
+    pl[:, :, 7:] = 0.0
+    pl[:, :, -1] = 1.0  # photon type flag
+    other = np.concatenate([particle_level, np.zeros((n, particle_level.shape[1], 1), np.float32)], axis=2)
+    particle_level = np.concatenate([other, pl], axis=1)
+    kin_raw = np.concatenate([kin_raw, pl[:, :, :4].copy()], axis=1)
+    mask = np.concatenate([mask, np.ones((n, k), np.float32)], axis=1)
+    return particle_level, kin_raw, mask
+
+
 def build_inputs(df, norm_params, rotate=C.ROTATE_PHI):
     """DataFrame -> dict of numpy arrays (encoder inputs, targets, cond, meta)."""
     if rotate:
         df = rotate_phi(df)
     particle_level, kin_raw, high_level, mask = build_arrays(df, build_interaction=False)
+    if C.PHOTON_SLOTS:
+        particle_level, kin_raw, mask = _add_photon_slots(df, particle_level, kin_raw, mask)
     particle_level = apply_particle_norm(particle_level, norm_params)
     high_level = apply_highlevel_norm(high_level, norm_params)
     targets, tmask = build_targets(particle_level, kin_raw, high_level, mask)
@@ -354,3 +393,4 @@ def interaction_norm_from(norm_params):
 
 
 assert NUM_PARTICLES == len(_PARTICLE_SLOTS)
+assert N_SLOTS == NUM_PARTICLES + len(PHOTON_PREFIXES)

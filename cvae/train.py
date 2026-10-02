@@ -15,7 +15,13 @@ contrastive_encoder's, reused directly. Batches are drawn with probability
 pseudo-data, so the in-batch dCor is a plain estimate on the physical mix).
 
 Loss = v2_model vae_loss (masked recon summed over targets, BCE on binary
-       heads, + KL_WEIGHT * KL(q(z|x) || N(0,I)))  [+ DISCO_WEIGHT * dCor^2(mu, myy), off]
+       heads, + KL_WEIGHT * KL(q(z|x) || N(0,I)))
+       [+ MYY_HEAD_WEIGHT * MSE(m_hat, c)]                fixed myy latent dim
+       [- ADV_WEIGHT * CE(adversary(mu), myy bin)]        via gradient reversal
+       [+ DISCO_WEIGHT * dCor^2(mu, myy), off]
+The adversary itself minimizes the CE (same optimizer; the reversal flips the
+sign for the encoder only). Model selection uses the val vae + head terms,
+counted only once the adversary / DisCo weights are at full strength.
 """
 from __future__ import annotations
 
@@ -42,21 +48,26 @@ from src.embedding_models.v2_model.train import _save_reconstruction_pdf
 from cvae import config as C
 from cvae import data as D
 from cvae.losses import distance_corr, hetero_vae_loss
-from cvae.model import ParTCVAE
+from cvae.model import ParTCVAE, grad_reverse, myy_bin
 
 logger = logging.getLogger("cvae.train")
 
 
 def _make_optimizer(model):
     # Same grouping as contrastive_encoder.train: no decay on 1-D params and class_token.
-    decay, no_decay = [], []
+    # The myy adversary gets its own group at ADV_LR_MULT x LR.
+    decay, no_decay, adv = [], [], []
     for n, p in model.named_parameters():
-        if p.requires_grad:
+        if not p.requires_grad:
+            continue
+        if n.startswith("adversary."):
+            adv.append(p)
+        else:
             (no_decay if (p.ndim == 1 or n.endswith("class_token")) else decay).append(p)
-    return optim.AdamW(
-        [{"params": decay, "weight_decay": C.WEIGHT_DECAY}, {"params": no_decay, "weight_decay": 0.0}],
-        lr=C.LR,
-    )
+    groups = [{"params": decay, "weight_decay": C.WEIGHT_DECAY}, {"params": no_decay, "weight_decay": 0.0}]
+    if adv:
+        groups.append({"params": adv, "weight_decay": 0.0, "lr": C.LR * C.ADV_LR_MULT})
+    return optim.AdamW(groups, lr=C.LR)
 
 
 def _make_scheduler(optimizer, total_steps):
@@ -70,12 +81,16 @@ def _make_scheduler(optimizer, total_steps):
     )
 
 
-def _loss_terms(model, batch, is_bin, lam, is_btag=None):
+METRICS = ("total", "recon", "kl", "dcor", "adv", "adv_acc", "mhat", "select")
+
+
+def _loss_terms(model, batch, is_bin, lam, is_btag=None, adv_lam=0.0):
+    """Returns (total loss, metrics vector in METRICS order, x_hat)."""
     pl, inter, hl, mask, tgt, tm, cond = batch
     if is_btag is not None and C.BTAG_POS_WEIGHT != 1.0:
         # Per-element weight inside the mask: vae_loss takes a masked weighted mean.
         tm = tm * (1.0 + (C.BTAG_POS_WEIGHT - 1.0) * tgt * is_btag)
-    x_hat, z, mu, logvar = model((pl, inter, hl, mask), cond)
+    x_hat, z, mu, logvar, m_hat = model((pl, inter, hl, mask), cond)
     # v2_model's masked VAE loss: per-event masked mean rescaled to a sum over
     # targets (so KL_WEIGHT means the same as for the v2 VAE), BCE on binary dims.
     # Batches are already drawn ∝ event_weight, hence unit weights here.
@@ -88,10 +103,29 @@ def _loss_terms(model, batch, is_bin, lam, is_btag=None):
         vae, rec, kl = vae_loss(tgt, x_hat.float(), mu.float(), logvar.float(), w, C.KL_WEIGHT,
                                 mask=tm, binary_dims=is_bin)
     lat = mu if C.DISCO_ON == "mu" else z
-    nd = min(C.DISCO_BATCH, len(lat))
-    dc = distance_corr(lat[:nd], cond[:nd])
+    zero = torch.zeros((), device=tgt.device)
+    if lam > 0 or C.DISCO_WEIGHT > 0:
+        nd = min(C.DISCO_BATCH, len(lat))
+        dc = distance_corr(lat[:nd], cond[:nd])
+    else:
+        dc = zero
     total = vae + lam * dc
-    return total, rec, kl, dc, x_hat
+    mh = zero
+    if m_hat is not None:
+        mh = ((m_hat.float() - cond) ** 2).mean()
+        total = total + C.MYY_HEAD_WEIGHT * mh
+    select = vae + C.MYY_HEAD_WEIGHT * mh
+    adv, adv_acc = zero, zero
+    adversary = getattr(model, "adversary", None)
+    if adversary is not None:
+        # The adversary always trains (minimizes CE); the encoder sees the
+        # reversed gradient scaled by adv_lam (0 during warm-up).
+        logits = adversary(grad_reverse(mu.float(), adv_lam)).float()
+        target = myy_bin(cond)
+        adv = torch.nn.functional.cross_entropy(logits, target)
+        adv_acc = (logits.argmax(1) == target).float().mean()
+        total = total + adv
+    return total, torch.stack([total, rec, kl, dc, adv, adv_acc, mh, select]).detach().float(), x_hat
 
 
 def disco_lambda(epoch):
@@ -102,15 +136,23 @@ def disco_lambda(epoch):
     return C.DISCO_WEIGHT * min(1.0, (epoch - C.DISCO_WARMUP_EPOCHS + 1) / ramp)
 
 
+def adv_lambda(epoch):
+    if C.ADV_WEIGHT <= 0 or epoch < C.ADV_WARMUP_EPOCHS:
+        return 0.0
+    ramp = max(C.ADV_RAMP_EPOCHS, 1)
+    return C.ADV_WEIGHT * min(1.0, (epoch - C.ADV_WARMUP_EPOCHS + 1) / ramp)
+
+
 def _plot_history(hist, path):
-    keys = ["total", "recon", "kl", "dcor"]
-    fig, axes = plt.subplots(1, 4, figsize=(16, 3.6))
+    keys = [k for k in METRICS if f"train_{k}" in hist]
+    fig, axes = plt.subplots(1, len(keys), figsize=(4 * len(keys), 3.6))
     for ax, k in zip(axes, keys):
         ax.plot(hist["epoch"], hist[f"train_{k}"], label="train")
         ax.plot(hist["epoch"], hist[f"val_{k}"], label="val")
         ax.set_title(k)
         ax.set_xlabel("epoch")
-        ax.set_yscale("log")
+        if k not in ("adv", "adv_acc"):
+            ax.set_yscale("log")
         ax.grid(True, alpha=0.3)
     axes[0].legend()
     fig.tight_layout()
@@ -230,7 +272,7 @@ def train(run_dir, seed=0, device="cuda"):
         )
         os.replace(tmp, last)
 
-    hist = {k: [] for k in ["epoch"] + [f"{s}_{t}" for s in ("train", "val") for t in ("total", "recon", "kl", "dcor")]}
+    hist = {k: [] for k in ["epoch"] + [f"{s}_{t}" for s in ("train", "val") for t in METRICS]}
     best_val, best_state, best_epoch, bad = float("inf"), None, -1, 0
     start_epoch = 0
     if resume is not None:
@@ -253,44 +295,45 @@ def train(run_dir, seed=0, device="cuda"):
     for epoch in range(start_epoch, C.EPOCHS):
         te = time.time()
         lam = disco_lambda(epoch)
+        alam = adv_lambda(epoch)
         base_model.train()
-        acc = torch.zeros(4, device=device)
+        acc = torch.zeros(len(METRICS), device=device)
         nb = 0
         for batch in train_loader:
             optimizer.zero_grad(set_to_none=True)
             with amp_ctx():
-                total, rec, kl, dc, _ = _loss_terms(model, batch, is_bin, lam, is_btag)
+                total, m, _ = _loss_terms(model, batch, is_bin, lam, is_btag, alam)
             total.backward()
             if C.GRAD_CLIP > 0:
                 torch.nn.utils.clip_grad_norm_(base_model.parameters(), C.GRAD_CLIP)
             optimizer.step()
             sched.step()
-            acc += torch.stack([total.detach(), rec.detach(), kl.detach(), dc.detach()]).float()
+            acc += m
             nb += 1
         tr_m = (acc / max(nb, 1)).tolist()
 
         base_model.eval()
-        vacc = torch.zeros(4, device=device)
+        vacc = torch.zeros(len(METRICS), device=device)
         with torch.no_grad():
             for b in range(n_vb):
                 with amp_ctx():
-                    total, rec, kl, dc, _ = _loss_terms(model, va_ds.get_batch(val_idx[b]), is_bin, lam, is_btag)
-                vacc += torch.stack([total, rec, kl, dc]).float()
+                    _t, m, _ = _loss_terms(model, va_ds.get_batch(val_idx[b]), is_bin, lam, is_btag, alam)
+                vacc += m
         va_m = (vacc / n_vb).tolist()
 
         hist["epoch"].append(epoch)
         for s, m in (("train", tr_m), ("val", va_m)):
-            for k, v in zip(("total", "recon", "kl", "dcor"), m):
+            for k, v in zip(METRICS, m):
                 hist[f"{s}_{k}"].append(v)
-        logger.info(
-            "epoch %3d  lam=%g  train tot=%.4f rec=%.4f kl=%.3f dcor=%.4f | val tot=%.4f rec=%.4f kl=%.3f dcor=%.4f | lr=%.2e %.0fs",
-            epoch, lam, *tr_m, *va_m, sched.get_last_lr()[0], time.time() - te,
-        )
+        fmt = lambda m: " ".join(f"{k}={v:.4g}" for k, v in zip(METRICS, m))  # noqa: E731
+        logger.info("epoch %3d  lam=%g adv=%g  train %s | val %s | lr=%.2e %.0fs",
+                    epoch, lam, alam, fmt(tr_m), fmt(va_m), sched.get_last_lr()[0], time.time() - te)
 
         # Only checkpoints at the full lambda are comparable (and are what we want).
-        if lam >= C.DISCO_WEIGHT:
-            if va_m[0] < best_val:
-                best_val, best_state, best_epoch, bad = va_m[0], deepcopy(base_model.state_dict()), epoch, 0
+        sel = va_m[METRICS.index("select")]
+        if lam >= C.DISCO_WEIGHT and alam >= C.ADV_WEIGHT:
+            if sel < best_val:
+                best_val, best_state, best_epoch, bad = sel, deepcopy(base_model.state_dict()), epoch, 0
                 _save(best_state, best_epoch, best_val)
             else:
                 bad += 1
@@ -315,7 +358,7 @@ def train(run_dir, seed=0, device="cuda"):
             idx = torch.arange(i, min(i + C.BATCH_SIZE, n_qa), device=device)
             pl, inter, hl, mask, _tgt, _tm, cond = va_ds.get_batch(idx)
             with amp_ctx():
-                outs.append(base_model.decode(base_model.encode((pl, inter, hl, mask), cond), cond).float().cpu().numpy())
+                outs.append(base_model((pl, inter, hl, mask), cond)[0].float().cpu().numpy())
     x_hat = np.concatenate(outs)
     binm = D.binary_target_mask()
     x_hat[:, binm] = 1.0 / (1.0 + np.exp(-x_hat[:, binm]))

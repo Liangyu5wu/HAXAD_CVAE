@@ -1,4 +1,5 @@
-"""ParT CVAE = contrastive_encoder's DPTModel (encoder) + myy-conditioned decoder (MLP or slot-query)."""
+"""ParT CVAE = contrastive_encoder's DPTModel (encoder) + myy-conditioned decoder (MLP or slot-query),
+optionally with a fixed myy latent dim (MYY_HEAD) and a myy adversary on z (ADV_WEIGHT)."""
 from __future__ import annotations
 
 import torch
@@ -29,7 +30,7 @@ class SlotDecoder(nn.Module):
 
     def __init__(self, in_dim, d=C.SLOT_DEC_DIM, n_layers=C.SLOT_DEC_LAYERS, n_heads=C.SLOT_DEC_HEADS):
         super().__init__()
-        self.n_slots = D.NUM_PARTICLES
+        self.n_slots = D.N_SLOTS
         self.slot_query = nn.Parameter(torch.randn(1, self.n_slots + 1, d) * 0.02)
         self.from_latent = _mlp([in_dim, d, d])
         layer = nn.TransformerEncoderLayer(d, n_heads, 3 * d, dropout=0.0, activation="gelu",
@@ -45,6 +46,43 @@ class SlotDecoder(nn.Module):
         h = self.norm(self.blocks(self.slot_query + self.from_latent(zc)[:, None, :]))
         out = torch.cat([self.slot_head(h[:, :-1]).flatten(1), self.event_head(h[:, -1])], dim=1)
         return out[:, self.gather_idx]
+
+
+class _GradReverse(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, g):
+        return -ctx.scale * g, None
+
+
+def grad_reverse(x, scale):
+    """Identity forward; gradient multiplied by -scale backward."""
+    return _GradReverse.apply(x, scale)
+
+
+class MyyAdversary(nn.Module):
+    """Classifies the SB myy bin from the latent (logits over ADV_BINS)."""
+
+    def __init__(self, latent_dim, hidden=C.ADV_HIDDEN, n_bins=C.ADV_BINS):
+        super().__init__()
+        self.net = _mlp([latent_dim, hidden, hidden, n_bins])
+
+    def forward(self, z):
+        return self.net(z)
+
+
+def myy_bin(cond, n_bins=C.ADV_BINS):
+    """SB myy bin of c = (myy - 125) / 20: n_bins/2 equal bins in 105-120 and in 130-145."""
+    c = cond[:, 0].float()
+    lo, hi = (C.SR_LOW - C.MYY_CENTER) / C.MYY_SCALE, (C.SR_HIGH - C.MYY_CENTER) / C.MYY_SCALE
+    half = n_bins // 2
+    b_lo = ((c + 1.0) / (lo + 1.0) * half).floor()
+    b_hi = half + ((c - hi) / (1.0 - hi) * half).floor()
+    return torch.where(c < 0, b_lo, b_hi).clamp(0, n_bins - 1).long()
 
 
 class ParTCVAE(nn.Module):
@@ -64,20 +102,27 @@ class ParTCVAE(nn.Module):
         dec_hidden=C.DEC_HIDDEN,
         cond_embed_dim=C.COND_EMBED_DIM,
         encoder_kwargs=None,
-        input_shape=C.INPUT_SHAPE,
+        input_shape=D.INPUT_SHAPE,
         enc_cond=C.ENC_COND,
         dec_learn_var=C.DEC_LEARN_VAR,
         decoder=C.DECODER,
+        myy_head=C.MYY_HEAD,
+        dec_myy=C.DEC_MYY,
+        adversary=C.ADV_WEIGHT > 0,
     ):
         super().__init__()
         self.latent_dim = latent_dim
+        self.myy_head = bool(myy_head)
+        self.dec_myy = dec_myy
+        assert dec_myy in ("true", "pred"), dec_myy
+        assert self.myy_head or dec_myy == "true", "DEC_MYY=pred needs MYY_HEAD"
         self.enc_cond = bool(enc_cond)
         if self.enc_cond:
             (n_hl,) = input_shape[2]
             input_shape = (input_shape[0], input_shape[1], (n_hl + n_cond,))
         self.encoder = DPTModel(
             input_shape=input_shape,
-            output_size=latent_dim,
+            output_size=latent_dim + (1 if self.myy_head else 0),  # [m_hat,] z
             output_activation="none",
             **(encoder_kwargs if encoder_kwargs is not None else C.ENCODER_KWARGS),
         )
@@ -91,6 +136,7 @@ class ParTCVAE(nn.Module):
             raise ValueError(f"CVAE_DECODER={decoder!r}: expected 'mlp' or 'slot'")
         # Learned per-target log-variance of the Gaussian decoder (continuous targets).
         self.dec_logvar = nn.Parameter(torch.zeros(n_targets)) if dec_learn_var else None
+        self.adversary = MyyAdversary(latent_dim) if adversary else None
 
     def _enc_inputs(self, x, cond):
         if not self.enc_cond:
@@ -98,16 +144,26 @@ class ParTCVAE(nn.Module):
         pl, inter, hl, mask = x
         return (pl, inter, torch.cat([hl, cond.to(hl.dtype)], dim=-1), mask)
 
+    def encode_full(self, x, cond):
+        """(m_hat | None, mu, logvar); m_hat is the fixed myy dim (deterministic,
+        no KL), mu / logvar the free dims z."""
+        mu, logvar = self.encoder.encode_mulogvar(self._enc_inputs(x, cond))
+        if not self.myy_head:
+            return None, mu, logvar
+        return mu[:, :1], mu[:, 1:], logvar[:, 1:]
+
     def encode_mulogvar(self, x, cond):
-        return self.encoder.encode_mulogvar(self._enc_inputs(x, cond))
+        _m, mu, logvar = self.encode_full(x, cond)
+        return mu, logvar
 
     def decode(self, z, cond):
         return self.decoder(torch.cat([z, self.cond_embed(cond)], dim=-1))
 
     def forward(self, x, cond):
-        mu, logvar = self.encode_mulogvar(x, cond)
+        m_hat, mu, logvar = self.encode_full(x, cond)
         z = self.encoder.reparameterize(mu, logvar) if self.training else mu
-        return self.decode(z, cond), z, mu, logvar
+        dec_c = m_hat if self.dec_myy == "pred" else cond
+        return self.decode(z, dec_c), z, mu, logvar, m_hat
 
     def encode(self, x, cond, sample=False):
         mu, logvar = self.encode_mulogvar(x, cond)

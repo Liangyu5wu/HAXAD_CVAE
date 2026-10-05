@@ -44,6 +44,8 @@ def load_model(ckpt_path, device):
         myy_head=cfg.get("MYY_HEAD", False),
         dec_myy=cfg.get("DEC_MYY", "true"),
         adversary=cfg.get("ADV_WEIGHT", 0.0) > 0,
+        adv_hidden=cfg.get("ADV_HIDDEN", 128),
+        adv_bins=cfg.get("ADV_BINS", 8),
     )
     model.load_state_dict(ck["model"])
     return model.to(device).eval(), ck

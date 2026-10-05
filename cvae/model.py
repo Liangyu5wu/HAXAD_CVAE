@@ -94,6 +94,8 @@ class ParTCVAE(nn.Module):
         myy_head=C.MYY_HEAD,
         dec_myy=C.DEC_MYY,
         adversary=C.ADV_WEIGHT > 0,
+        adv_hidden=C.ADV_HIDDEN,
+        adv_bins=C.ADV_BINS,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -126,7 +128,7 @@ class ParTCVAE(nn.Module):
             raise ValueError(f"CVAE_DECODER={decoder!r}: expected 'mlp' or 'slot'")
         # Learned per-target log-variance of the Gaussian decoder (continuous targets).
         self.dec_logvar = nn.Parameter(torch.zeros(n_targets)) if dec_learn_var else None
-        self.adversary = MyyAdversary(latent_dim) if adversary else None
+        self.adversary = MyyAdversary(latent_dim, adv_hidden, adv_bins) if adversary else None
 
     def _enc_inputs(self, x, cond):
         if not self.enc_cond:

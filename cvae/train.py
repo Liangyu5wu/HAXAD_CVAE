@@ -52,6 +52,10 @@ from cvae.model import ParTCVAE, myy_bin
 
 logger = logging.getLogger("cvae.train")
 
+# Knobs introduced later, with the value that reproduces the old behaviour;
+# a checkpoint without them may resume under exactly these values.
+BACKCOMPAT_DEFAULTS = {"COND_EMBED": "mlp"}
+
 
 def _make_optimizer(model):
     # Same grouping as contrastive_encoder.train: no decay on 1-D params and class_token.
@@ -197,6 +201,8 @@ def train(run_dir, seed=0, device="cuda"):
     resume = torch.load(last, map_location="cpu", weights_only=False) if os.path.exists(last) else None
     if resume is not None:
         old = json.loads(json.dumps(resume["config"], default=str))
+        for k, v in BACKCOMPAT_DEFAULTS.items():  # knobs added after the checkpoint was written
+            old.setdefault(k, v)
         new = json.loads(json.dumps(cfg, default=str))
         diff = {k: (old.get(k), new.get(k)) for k in set(old) | set(new) if old.get(k) != new.get(k)}
         if diff or resume["seed"] != seed:

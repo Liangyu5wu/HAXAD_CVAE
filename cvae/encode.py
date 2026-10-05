@@ -36,6 +36,7 @@ def load_model(ckpt_path, device):
         latent_dim=cfg["LATENT_DIM"],
         dec_hidden=tuple(cfg["DEC_HIDDEN"]),
         cond_embed_dim=cfg["COND_EMBED_DIM"],
+        cond_embed=cfg.get("COND_EMBED", "mlp"),
         encoder_kwargs=cfg["ENCODER_KWARGS"],
         enc_cond=cfg.get("ENC_COND", False),  # absent in pre-ENC_COND checkpoints
         dec_learn_var=cfg.get("DEC_LEARN_VAR", False),

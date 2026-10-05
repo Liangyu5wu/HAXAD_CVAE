@@ -41,6 +41,9 @@ ROTATE_PHI = _env_flag("CVAE_ROTATE_PHI", True)
 # Latent = [z (LATENT_DIM free dims), myy (fixed dim, fed to the decoder only)].
 # The encoder never sees myy (with it, myy leaks into z: SB low-vs-high AUC 0.93).
 LATENT_DIM = _env_int("CVAE_LATENT_DIM", 16)
+# How myy enters the decoder: "mlp" = c -> MLP(1 -> COND_EMBED_DIM -> COND_EMBED_DIM),
+# then concatenated with z; "none" = c concatenated with z directly (17 inputs).
+COND_EMBED = os.environ.get("CVAE_COND_EMBED", "mlp").strip().lower()
 COND_EMBED_DIM = _env_int("CVAE_COND_EMBED_DIM", 32)
 # Decoder: "slot" (default) = slot-query transformer, after
 # Patchouligoo/particle_transformer_ae: learned per-slot queries + broadcast

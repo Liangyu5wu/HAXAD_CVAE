@@ -85,6 +85,7 @@ class ParTCVAE(nn.Module):
         n_cond=1,
         dec_hidden=C.DEC_HIDDEN,
         cond_embed_dim=C.COND_EMBED_DIM,
+        cond_embed=C.COND_EMBED,
         encoder_kwargs=None,
         input_shape=D.INPUT_SHAPE,
         enc_cond=C.ENC_COND,
@@ -110,7 +111,12 @@ class ParTCVAE(nn.Module):
             output_activation="none",
             **(encoder_kwargs if encoder_kwargs is not None else C.ENCODER_KWARGS),
         )
-        self.cond_embed = _mlp([n_cond, cond_embed_dim, cond_embed_dim])
+        if cond_embed == "mlp":
+            self.cond_embed = _mlp([n_cond, cond_embed_dim, cond_embed_dim])
+        elif cond_embed == "none":
+            self.cond_embed, cond_embed_dim = nn.Identity(), n_cond
+        else:
+            raise ValueError(f"CVAE_COND_EMBED={cond_embed!r}: expected 'mlp' or 'none'")
         if decoder == "slot":
             self.decoder = SlotDecoder(latent_dim + cond_embed_dim)
             assert len(self.decoder.gather_idx) == n_targets
